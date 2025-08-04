@@ -3,24 +3,55 @@
  * @Github: https://github.com/jiejieTop
  * @Date: 2019-12-09 21:31:25
  * @LastEditTime : 2023-03-26 17:18:35
- * @Description: the code belongs to jiejie, please keep the author information and source code according to the license.
+ * @Description: MQTT 客户端核心实现文件
+ *               该文件实现了完整的 MQTT 3.1.1 协议客户端功能，包括：
+ *               - 网络连接管理（TCP/TLS）
+ *               - MQTT 协议报文处理（CONNECT, PUBLISH, SUBSCRIBE 等）
+ *               - QoS 0/1/2 消息传输保证
+ *               - 自动重连和保活机制
+ *               - 线程安全的并发处理
+ *               代码属于 jiejie，请根据许可证保留作者信息和源代码。
  */
 #include "mqttclient.h"
 
-#define     MQTT_MIN_PAYLOAD_SIZE   2               
-#define     MQTT_MAX_PAYLOAD_SIZE   268435455       // MQTT imposes a maximum payload size of 268435455 bytes.
+/* MQTT 协议相关常量定义 */
+#define     MQTT_MIN_PAYLOAD_SIZE   2               // MQTT 最小负载大小（字节）
+#define     MQTT_MAX_PAYLOAD_SIZE   268435455       // MQTT 最大负载大小（268MB）
 
+/**
+ * @brief 默认消息处理函数
+ * 
+ * 当用户未指定消息回调函数时，使用此函数作为默认的消息处理器。
+ * 该函数会打印接收到的消息信息，包括主题、QoS 级别和消息内容。
+ * 
+ * @param[in] client  指向 MQTT 客户端实例的指针
+ * @param[in] msg     指向消息数据的指针，包含主题和消息内容
+ */
 static void default_msg_handler(void* client, message_data_t* msg)
 {
     MQTT_LOG_I("%s:%d %s()...\ntopic: %s, qos: %d, \nmessage:%s", __FILE__, __LINE__, __FUNCTION__, 
             msg->topic_name, msg->message->qos, (char*)msg->message->payload);
 }
 
+/**
+ * @brief 获取 MQTT 客户端当前状态
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 客户端当前状态（CLIENT_STATE_*）
+ */
 static client_state_t mqtt_get_client_state(mqtt_client_t* c)
 {
     return c->mqtt_client_state;
 }
 
+/**
+ * @brief 设置 MQTT 客户端状态
+ * 
+ * 线程安全地更新客户端状态，使用全局锁保护状态变量。
+ * 
+ * @param[in] c      指向 MQTT 客户端实例的指针
+ * @param[in] state  要设置的新状态
+ */
 static void mqtt_set_client_state(mqtt_client_t* c, client_state_t state)
 {
     platform_mutex_lock(&c->mqtt_global_lock);
@@ -28,6 +59,17 @@ static void mqtt_set_client_state(mqtt_client_t* c, client_state_t state)
     platform_mutex_unlock(&c->mqtt_global_lock);
 }
 
+/**
+ * @brief 检查 MQTT 客户端是否已连接
+ * 
+ * 验证客户端状态，确保可以进行 MQTT 操作。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 客户端已连接且状态正常
+ *   - MQTT_CLEAN_SESSION_ERROR: 客户端处于清理会话状态
+ *   - MQTT_NOT_CONNECT_ERROR: 客户端未连接
+ */
 static int mqtt_is_connected(mqtt_client_t* c)
 {
     client_state_t state;
@@ -41,6 +83,17 @@ static int mqtt_is_connected(mqtt_client_t* c)
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
+/**
+ * @brief 设置 PUBLISH 报文的 DUP 标志
+ * 
+ * 用于 QoS 1/2 消息重传时设置 DUP 标志，表示这是重复发送的消息。
+ * 
+ * @param[in] c    指向 MQTT 客户端实例的指针
+ * @param[in] dup  DUP 标志值（0 或 1）
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 设置成功
+ *   - MQTT_SET_PUBLISH_DUP_FAILED_ERROR: 设置失败
+ */
 static int mqtt_set_publish_dup(mqtt_client_t* c, uint8_t dup)
 {
     uint8_t *read_data = c->mqtt_write_buf;
@@ -50,22 +103,35 @@ static int mqtt_set_publish_dup(mqtt_client_t* c, uint8_t dup)
     if (NULL == c->mqtt_write_buf)
         RETURN_ERROR(MQTT_SET_PUBLISH_DUP_FAILED_ERROR);
 
-    header.byte = readChar(&read_data); /* read header */
+    header.byte = readChar(&read_data); /* 读取报文头 */
 
     if (header.bits.type != PUBLISH)
         RETURN_ERROR(MQTT_SET_PUBLISH_DUP_FAILED_ERROR);
     
     header.bits.dup = dup;
-    writeChar(&write_data, header.byte); /* write header */
+    writeChar(&write_data, header.byte); /* 写回修改后的报文头 */
 
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
+/**
+ * @brief 检查 ACK 处理器数量是否已达上限
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 1: 已达上限, 0: 未达上限
+ */
 static int mqtt_ack_handler_is_maximum(mqtt_client_t* c)
 {
     return (c->mqtt_ack_handler_number >= MQTT_ACK_HANDLER_NUM_MAX) ? 1 : 0;
 }
 
+/**
+ * @brief 增加 ACK 处理器计数
+ * 
+ * 线程安全地增加待确认消息的数量。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ */
 static void mqtt_add_ack_handler_num(mqtt_client_t* c)
 {
     platform_mutex_lock(&c->mqtt_global_lock);
@@ -73,6 +139,15 @@ static void mqtt_add_ack_handler_num(mqtt_client_t* c)
     platform_mutex_unlock(&c->mqtt_global_lock);
 }
 
+/**
+ * @brief 减少 ACK 处理器计数
+ * 
+ * 线程安全地减少待确认消息的数量。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 操作成功
+ */
 static int mqtt_subtract_ack_handler_num(mqtt_client_t* c)
 {
     int rc = MQTT_SUCCESS_ERROR;
@@ -88,6 +163,14 @@ exit:
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 获取下一个可用的报文 ID
+ * 
+ * 线程安全地生成递增的报文 ID，用于匹配请求和响应。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 下一个报文 ID（1-65535 循环）
+ */
 static uint16_t mqtt_get_next_packet_id(mqtt_client_t *c) 
 {
     platform_mutex_lock(&c->mqtt_global_lock);
@@ -96,6 +179,16 @@ static uint16_t mqtt_get_next_packet_id(mqtt_client_t *c)
     return c->mqtt_packet_id;
 }
 
+/**
+ * @brief 解码 MQTT 报文长度字段
+ * 
+ * 按照 MQTT 协议规范解析可变长度字段，最多支持 4 字节编码。
+ * 
+ * @param[in]  c      指向 MQTT 客户端实例的指针
+ * @param[out] value  解析出的长度值
+ * @param[in]  timeout 读取超时时间（毫秒）
+ * @return 读取的字节数，失败时返回错误码
+ */
 static int mqtt_decode_packet(mqtt_client_t* c, int* value, int timeout)
 {
     uint8_t i;
@@ -108,19 +201,29 @@ static int mqtt_decode_packet(mqtt_client_t* c, int* value, int timeout)
         int rc = MQTTPACKET_READ_ERROR;
 
         if (++len > MAX_NO_OF_REMAINING_LENGTH_BYTES) {
-            rc = MQTTPACKET_READ_ERROR; /* bad data */
+            rc = MQTTPACKET_READ_ERROR; /* 数据格式错误 */
             goto exit;
         }
-        rc = network_read(c->mqtt_network, &i, 1, timeout);  /* read network data */
+        rc = network_read(c->mqtt_network, &i, 1, timeout);  /* 从网络读取数据 */
         if (rc != 1)
             goto exit;
-        *value += (i & 127) * multiplier;   /* decode data length according to mqtt protocol */
+        *value += (i & 127) * multiplier;   /* 按照 MQTT 协议解码长度 */
         multiplier *= 128;
     } while ((i & 128) != 0);
 exit:
     return len;
 }
 
+/**
+ * @brief 丢弃损坏的 MQTT 报文数据
+ * 
+ * 当缓冲区大小不足以容纳完整报文时，读取并丢弃剩余数据，
+ * 确保网络缓冲区清空，避免影响后续报文处理。
+ * 
+ * @param[in] c         指向 MQTT 客户端实例的指针
+ * @param[in] timer     超时定时器
+ * @param[in] packet_len 需要丢弃的报文长度
+ */
 static void mqtt_packet_drain(mqtt_client_t* c, platform_timer_t *timer, int packet_len)
 {
     int total_bytes_read = 0, read_len = 0, bytes2read = 0;
@@ -141,9 +244,21 @@ static void mqtt_packet_drain(mqtt_client_t* c, platform_timer_t *timer, int pac
                 bytes2read = packet_len - total_bytes_read;
             }
         }
-    } while ((total_bytes_read < packet_len) && (0 != read_len));   /* read and discard all corrupted data */
+    } while ((total_bytes_read < packet_len) && (0 != read_len));   /* 读取并丢弃所有损坏的数据 */
 }
 
+/**
+ * @brief 读取一个完整的 MQTT 报文
+ * 
+ * 从网络读取 MQTT 报文头，解析报文类型和长度，然后读取完整的报文数据。
+ * 
+ * @param[in]  c           指向 MQTT 客户端实例的指针
+ * @param[out] packet_type 解析出的报文类型
+ * @param[in]  timer       超时定时器
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 读取成功
+ *   - 其他错误码: 读取失败
+ */
 static int mqtt_read_packet(mqtt_client_t* c, int* packet_type, platform_timer_t* timer)
 {
     MQTTHeader header = {0};
@@ -157,26 +272,26 @@ static int mqtt_read_packet(mqtt_client_t* c, int* packet_type, platform_timer_t
     platform_timer_init(timer);
     platform_timer_cutdown(timer, c->mqtt_cmd_timeout);
 
-    /* 1. read the header byte.  This has the packet type in it */
+    /* 1. 读取报文头字节，包含报文类型 */
     rc = network_read(c->mqtt_network, c->mqtt_read_buf, len, platform_timer_remain(timer));
     if (rc != len)
         RETURN_ERROR(MQTT_NOTHING_TO_READ_ERROR);
 
-    /* 2. read the remaining length.  This is variable in itself */
+    /* 2. 读取剩余长度字段（可变长度编码） */
     mqtt_decode_packet(c, &remain_len, platform_timer_remain(timer));
 
-    /* put the original remaining length back into the buffer */
+    /* 将原始剩余长度编码放回缓冲区 */
     len += MQTTPacket_encode(c->mqtt_read_buf + len, remain_len); 
 
     if ((len + remain_len) > c->mqtt_read_buf_size) {
         
-        /* mqtt buffer is too short, read and discard all corrupted data */
+        /* MQTT 缓冲区太小，读取并丢弃所有损坏的数据 */
         mqtt_packet_drain(c, timer, remain_len);
 
         RETURN_ERROR(MQTT_BUFFER_TOO_SHORT_ERROR);
     }
 
-    /* 3. read the rest of the buffer using a callback to supply the rest of the data */
+    /* 3. 读取报文的剩余部分 */
     if ((remain_len > 0) && ((rc = network_read(c->mqtt_network, c->mqtt_read_buf + len, remain_len, platform_timer_remain(timer))) != remain_len))
         RETURN_ERROR(MQTT_NOTHING_TO_READ_ERROR);
 
@@ -240,7 +355,7 @@ static int mqtt_send_packet(mqtt_client_t* c, int length, platform_timer_t* time
 
     // 判断是否成功发送了全部数据
     if (sent == length) {
-        // 发送成功：重置客户端“最后发送时间”定时器
+        // 发送成功：重置客户端"最后发送时间"定时器
         // 用于后续的 Keep-Alive（PING）机制判断是否需要发送 PINGREQ
         platform_timer_cutdown(&c->mqtt_last_sent, (c->mqtt_keep_alive_interval * 1000));
 
@@ -251,6 +366,24 @@ static int mqtt_send_packet(mqtt_client_t* c, int length, platform_timer_t* time
     RETURN_ERROR(MQTT_SEND_PACKET_ERROR);
 }
 
+/**
+ * @brief 检查两个主题是否完全相等
+ * 
+ * 比较两个主题字符串是否完全相同，不支持通配符匹配。
+ * 
+ * @param[in] topic_filter  主题过滤器
+ * @param[in] topic         要比较的主题
+ * @return 1: 相等, 0: 不相等
+ */
+/**
+ * @brief 检查两个主题是否完全相等
+ * 
+ * 比较两个主题字符串是否完全相同，不支持通配符匹配。
+ * 
+ * @param[in] topic_filter  主题过滤器
+ * @param[in] topic         要比较的主题
+ * @return 1: 相等, 0: 不相等
+ */
 static int mqtt_is_topic_equals(const char *topic_filter, const char *topic)
 {
     int topic_len = 0;
@@ -267,6 +400,17 @@ static int mqtt_is_topic_equals(const char *topic_filter, const char *topic)
     return 0;
 }
 
+/**
+ * @brief 检查主题是否匹配（支持通配符）
+ * 
+ * 支持 MQTT 通配符匹配：
+ * - '+' 匹配单层主题
+ * - '#' 匹配多层主题
+ * 
+ * @param[in] topic_filter  主题过滤器（可包含通配符）
+ * @param[in] topic_name    要匹配的主题
+ * @return 1: 匹配, 0: 不匹配
+ */
 static char mqtt_topic_is_matched(char* topic_filter, MQTTString* topic_name)
 {
     char* curf = topic_filter;
@@ -278,7 +422,7 @@ static char mqtt_topic_is_matched(char* topic_filter, MQTTString* topic_name)
         if (*curn == '/' && *curf != '/')
             break;
         
-        /* support wildcards for MQTT topics, such as '#' '+' */
+        /* 支持 MQTT 主题通配符，如 '#' '+' */
         if (*curf != '+' && *curf != '#' && *curf != *curn) 
             break;
         
@@ -296,25 +440,44 @@ static char mqtt_topic_is_matched(char* topic_filter, MQTTString* topic_name)
     return (curn == curn_end) && (*curf == '\0');
 }
 
+/**
+ * @brief 创建新的消息数据结构
+ * 
+ * 将 MQTT 报文中的主题和消息内容封装成标准格式，供回调函数使用。
+ * 
+ * @param[out] md          输出消息数据结构
+ * @param[in]  topic_name  主题名称
+ * @param[in]  message     消息内容
+ */
 static void mqtt_new_message_data(message_data_t* md, MQTTString* topic_name, mqtt_message_t* message)
 {
     int len;
     len = (topic_name->lenstring.len < MQTT_TOPIC_LEN_MAX - 1) ? topic_name->lenstring.len : MQTT_TOPIC_LEN_MAX - 1;
     memcpy(md->topic_name, topic_name->lenstring.data, len);
-    md->topic_name[len] = '\0';     /* the topic name is too long and will be truncated */
+    md->topic_name[len] = '\0';     /* 主题名称过长将被截断 */
     md->message = message;
 }
 
+/**
+ * @brief 获取匹配主题的消息处理器
+ * 
+ * 遍历消息处理器列表，查找与指定主题匹配的处理器。
+ * 支持精确匹配和通配符匹配。
+ * 
+ * @param[in] c          指向 MQTT 客户端实例的指针
+ * @param[in] topic_name 要匹配的主题
+ * @return 匹配的消息处理器，未找到时返回 NULL
+ */
 static message_handlers_t *mqtt_get_msg_handler(mqtt_client_t* c, MQTTString* topic_name)
 {
     mqtt_list_t *curr, *next;
     message_handlers_t *msg_handler;
 
-    /* traverse the msg_handler_list to find the matching message handler */
+    /* 遍历消息处理器列表，查找匹配的消息处理器 */
     LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_msg_handler_list) {
         msg_handler = LIST_ENTRY(curr, message_handlers_t, list);
 
-        /* judge topic is equal or match, support wildcard, such as '#' '+' */
+        /* 判断主题是否相等或匹配，支持通配符，如 '#' '+' */
         if ((NULL != msg_handler->topic_filter) && ((MQTTPacket_equals(topic_name, (char*)msg_handler->topic_filter)) || 
             (mqtt_topic_is_matched((char*)msg_handler->topic_filter, topic_name)))) {
                 return msg_handler;
@@ -323,22 +486,35 @@ static message_handlers_t *mqtt_get_msg_handler(mqtt_client_t* c, MQTTString* to
     return NULL;
 }
 
+/**
+ * @brief 投递消息到对应的处理器
+ * 
+ * 根据主题找到对应的消息处理器，创建消息数据结构并调用回调函数。
+ * 如果未找到处理器，则调用拦截器处理器（如果存在）。
+ * 
+ * @param[in] c          指向 MQTT 客户端实例的指针
+ * @param[in] topic_name 消息主题
+ * @param[in] message    消息内容
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 投递成功
+ *   - MQTT_FAILED_ERROR: 投递失败
+ */
 static int mqtt_deliver_message(mqtt_client_t* c, MQTTString* topic_name, mqtt_message_t* message)
 {
     int rc = MQTT_FAILED_ERROR;
     message_handlers_t *msg_handler;
     
-    /* get mqtt message handler */
+    /* 获取 MQTT 消息处理器 */
     msg_handler = mqtt_get_msg_handler(c, topic_name);
     
     if (NULL != msg_handler) {
         message_data_t md;
-        mqtt_new_message_data(&md, topic_name, message);    /* make a message data */
-        msg_handler->handler(c, &md);       /* deliver the message */
+        mqtt_new_message_data(&md, topic_name, message);    /* 创建消息数据 */
+        msg_handler->handler(c, &md);       /* 投递消息 */
         rc = MQTT_SUCCESS_ERROR;
     } else if (NULL != c->mqtt_interceptor_handler) {
         message_data_t md;
-        mqtt_new_message_data(&md, topic_name, message);    /* make a message data */
+        mqtt_new_message_data(&md, topic_name, message);    /* 创建消息数据 */
         c->mqtt_interceptor_handler(c, &md);
         rc = MQTT_SUCCESS_ERROR;
     }
@@ -349,6 +525,18 @@ static int mqtt_deliver_message(mqtt_client_t* c, MQTTString* topic_name, mqtt_m
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 创建 ACK 处理器
+ * 
+ * 为需要确认的 MQTT 报文创建 ACK 处理器，用于跟踪重传和超时。
+ * 
+ * @param[in] c           指向 MQTT 客户端实例的指针
+ * @param[in] type        报文类型
+ * @param[in] packet_id   报文 ID
+ * @param[in] payload_len 负载长度
+ * @param[in] handler     消息处理器（用于订阅/取消订阅）
+ * @return 创建的 ACK 处理器，失败时返回 NULL
+ */
 static ack_handlers_t *mqtt_ack_handler_create(mqtt_client_t* c, int type, uint16_t packet_id, uint16_t payload_len, message_handlers_t* handler)
 {
     ack_handlers_t *ack_handler = NULL;
@@ -359,41 +547,67 @@ static ack_handlers_t *mqtt_ack_handler_create(mqtt_client_t* c, int type, uint1
 
     mqtt_list_init(&ack_handler->list);
     platform_timer_init(&ack_handler->timer);
-    platform_timer_cutdown(&ack_handler->timer, c->mqtt_cmd_timeout);    /* No response within timeout will be destroyed or resent */
+    platform_timer_cutdown(&ack_handler->timer, c->mqtt_cmd_timeout);    /* 超时时间内无响应将被销毁或重发 */
 
     ack_handler->type = type;
     ack_handler->packet_id = packet_id;
     ack_handler->payload_len = payload_len;
     ack_handler->payload = (uint8_t *)ack_handler + sizeof(ack_handlers_t);
     ack_handler->handler = handler;
-    memcpy(ack_handler->payload, c->mqtt_write_buf, payload_len);    /* save the data in ack handler*/
+    memcpy(ack_handler->payload, c->mqtt_write_buf, payload_len);    /* 在 ACK 处理器中保存数据 */
     
     return ack_handler;
 }
 
+/**
+ * @brief 销毁 ACK 处理器
+ * 
+ * 从列表中删除 ACK 处理器并释放内存。
+ * 
+ * @param[in] ack_handler 要销毁的 ACK 处理器
+ */
 static void mqtt_ack_handler_destroy(ack_handlers_t* ack_handler)
 { 
     if (NULL != &ack_handler->list) {
         mqtt_list_del(&ack_handler->list);
-        platform_memory_free(ack_handler);  /* delete ack handler from the list, and free memory */
+        platform_memory_free(ack_handler);  /* 从列表中删除 ACK 处理器，并释放内存 */
     }
 }
 
+/**
+ * @brief 重发 ACK 处理器中的报文
+ * 
+ * 当 ACK 处理器超时时，重新发送对应的报文。
+ * 
+ * @param[in] c           指向 MQTT 客户端实例的指针
+ * @param[in] ack_handler 要重发的 ACK 处理器
+ */
 static void mqtt_ack_handler_resend(mqtt_client_t* c, ack_handlers_t* ack_handler)
 { 
     platform_timer_t timer;
     platform_timer_init(&timer);
     platform_timer_cutdown(&timer, c->mqtt_cmd_timeout);
-    platform_timer_cutdown(&ack_handler->timer, c->mqtt_cmd_timeout); /* timeout, recutdown */
+    platform_timer_cutdown(&ack_handler->timer, c->mqtt_cmd_timeout); /* 超时，重新倒计时 */
 
     platform_mutex_lock(&c->mqtt_write_lock);
-    memcpy(c->mqtt_write_buf, ack_handler->payload, ack_handler->payload_len);   /* copy data to write buf form ack handler */
+    memcpy(c->mqtt_write_buf, ack_handler->payload, ack_handler->payload_len);   /* 从 ACK 处理器复制数据到写缓冲区 */
     
-    mqtt_send_packet(c, ack_handler->payload_len, &timer);      /* resend data */
+    mqtt_send_packet(c, ack_handler->payload_len, &timer);      /* 重发数据 */
     platform_mutex_unlock(&c->mqtt_write_lock);
     MQTT_LOG_W("%s:%d %s()... resend %d package, packet_id is %d ", __FILE__, __LINE__, __FUNCTION__, ack_handler->type, ack_handler->packet_id);
 }
 
+/**
+ * @brief 检查 ACK 列表中是否存在指定节点
+ * 
+ * 对于 QoS1 和 QoS2 的 MQTT 报文，可以使用报文 ID 和类型作为唯一标识符，
+ * 判断节点是否已存在，避免重复添加。
+ * 
+ * @param[in] c         指向 MQTT 客户端实例的指针
+ * @param[in] type      报文类型
+ * @param[in] packet_id 报文 ID
+ * @return 1: 存在, 0: 不存在
+ */
 static int mqtt_ack_list_node_is_exist(mqtt_client_t* c, int type, uint16_t packet_id)
 {
     mqtt_list_t *curr, *next;
@@ -405,8 +619,8 @@ static int mqtt_ack_list_node_is_exist(mqtt_client_t* c, int type, uint16_t pack
     LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_ack_handler_list) {
         ack_handler = LIST_ENTRY(curr, ack_handlers_t, list);
 
-         /* For mqtt packets of qos1 and qos2, you can use the packet id and type as the unique
-            identifier to determine whether the node already exists and avoid repeated addition. */
+         /* 对于 QoS1 和 QoS2 的 MQTT 报文，可以使用报文 ID 和类型作为唯一
+            标识符来判断节点是否已存在，避免重复添加。 */
         if ((packet_id  == ack_handler->packet_id) && (type == ack_handler->type))     
             return 1;
     }
@@ -414,16 +628,29 @@ static int mqtt_ack_list_node_is_exist(mqtt_client_t* c, int type, uint16_t pack
     return 0;
 }
 
+/**
+ * @brief 在 ACK 列表中记录新的 ACK 处理器
+ * 
+ * @param[in] c           指向 MQTT 客户端实例的指针
+ * @param[in] type        报文类型
+ * @param[in] packet_id   报文 ID
+ * @param[in] payload_len 负载长度
+ * @param[in] handler     消息处理器
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 记录成功
+ *   - MQTT_ACK_NODE_IS_EXIST_ERROR: 节点已存在
+ *   - MQTT_MEM_NOT_ENOUGH_ERROR: 内存不足
+ */
 static int mqtt_ack_list_record(mqtt_client_t* c, int type, uint16_t packet_id, uint16_t payload_len, message_handlers_t* handler)
 {
     int rc = MQTT_SUCCESS_ERROR;
     ack_handlers_t *ack_handler = NULL;
     
-    /* Determine if the node already exists */
+    /* 判断节点是否已存在 */
     if (mqtt_ack_list_node_is_exist(c, type, packet_id))
         RETURN_ERROR(MQTT_ACK_NODE_IS_EXIST_ERROR);
 
-    /* create a ack handler node */
+    /* 创建 ACK 处理器节点 */
     ack_handler = mqtt_ack_handler_create(c, type, packet_id, payload_len, handler);
     if (NULL == ack_handler)
         RETURN_ERROR(MQTT_MEM_NOT_ENOUGH_ERROR);
@@ -435,6 +662,16 @@ static int mqtt_ack_list_record(mqtt_client_t* c, int type, uint16_t packet_id, 
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 从 ACK 列表中删除记录
+ * 
+ * @param[in]  c          指向 MQTT 客户端实例的指针
+ * @param[in]  type       报文类型
+ * @param[in]  packet_id  报文 ID
+ * @param[out] handler    返回的消息处理器（可选）
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 删除成功
+ */
 static int mqtt_ack_list_unrecord(mqtt_client_t* c, int type, uint16_t packet_id, message_handlers_t **handler)
 {
     mqtt_list_t *curr, *next;
@@ -452,14 +689,21 @@ static int mqtt_ack_list_unrecord(mqtt_client_t* c, int type, uint16_t packet_id
         if (handler)
             *handler = ack_handler->handler;
         
-        /* destroy a ack handler node */
+        /* 销毁 ACK 处理器节点 */
         mqtt_ack_handler_destroy(ack_handler);
         mqtt_subtract_ack_handler_num(c);
     }
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
-
+/**
+ * @brief 创建消息处理器
+ * 
+ * @param[in] topic_filter  主题过滤器
+ * @param[in] qos           QoS 级别
+ * @param[in] handler       消息回调函数
+ * @return 创建的消息处理器，失败时返回 NULL
+ */
 static message_handlers_t *mqtt_msg_handler_create(const char* topic_filter, mqtt_qos_t qos, message_handler_t handler)
 {
     message_handlers_t *msg_handler = NULL;
@@ -471,12 +715,17 @@ static message_handlers_t *mqtt_msg_handler_create(const char* topic_filter, mqt
     mqtt_list_init(&msg_handler->list);
     
     msg_handler->qos = qos;
-    msg_handler->handler = handler;     /* register  callback handler */
+    msg_handler->handler = handler;     /* 注册回调处理器 */
     msg_handler->topic_filter = topic_filter;
 
     return msg_handler;
 }
 
+/**
+ * @brief 销毁消息处理器
+ * 
+ * @param[in] msg_handler 要销毁的消息处理器
+ */
 static void mqtt_msg_handler_destory(message_handlers_t *msg_handler)
 {
     if (NULL != &msg_handler->list) {
@@ -485,6 +734,15 @@ static void mqtt_msg_handler_destory(message_handlers_t *msg_handler)
     }
 }
 
+/**
+ * @brief 检查消息处理器是否已存在
+ * 
+ * 通过 MQTT 主题判断节点是否已存在，但不支持通配符。
+ * 
+ * @param[in] c       指向 MQTT 客户端实例的指针
+ * @param[in] handler 要检查的消息处理器
+ * @return 1: 存在, 0: 不存在
+ */
 static int mqtt_msg_handler_is_exist(mqtt_client_t* c, message_handlers_t *handler)
 {
     mqtt_list_t *curr, *next;
@@ -496,7 +754,7 @@ static int mqtt_msg_handler_is_exist(mqtt_client_t* c, message_handlers_t *handl
     LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_msg_handler_list) {
         msg_handler = LIST_ENTRY(curr, message_handlers_t, list);
 
-        /* determine whether a node already exists by mqtt topic, but wildcards are not supported */
+        /* 通过 MQTT 主题判断节点是否已存在，但不支持通配符 */
         if ((NULL != msg_handler->topic_filter) && (mqtt_is_topic_equals(msg_handler->topic_filter, handler->topic_filter))) {
             MQTT_LOG_W("%s:%d %s()...msg_handler->topic_filter: %s, handler->topic_filter: %s", 
                         __FILE__, __LINE__, __FUNCTION__, msg_handler->topic_filter, handler->topic_filter);
@@ -507,6 +765,15 @@ static int mqtt_msg_handler_is_exist(mqtt_client_t* c, message_handlers_t *handl
     return 0;
 }
 
+/**
+ * @brief 安装消息处理器
+ * 
+ * @param[in] c       指向 MQTT 客户端实例的指针
+ * @param[in] handler 要安装的消息处理器
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 安装成功
+ *   - MQTT_NULL_VALUE_ERROR: 参数为空
+ */
 static int mqtt_msg_handlers_install(mqtt_client_t* c, message_handlers_t *handler)
 {
     if ((NULL == c) || (NULL == handler))
@@ -517,25 +784,31 @@ static int mqtt_msg_handlers_install(mqtt_client_t* c, message_handlers_t *handl
         RETURN_ERROR(MQTT_SUCCESS_ERROR);
     }
 
-    /* install to  msg_handler_list*/
+    /* 安装到消息处理器列表 */
     mqtt_list_add_tail(&handler->list, &c->mqtt_msg_handler_list);
 
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
-
+/**
+ * @brief 清理 MQTT 会话
+ * 
+ * 释放所有 ACK 处理器和消息处理器的内存，重置客户端状态。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ */
 static void mqtt_clean_session(mqtt_client_t* c)
 {
     mqtt_list_t *curr, *next;
     ack_handlers_t *ack_handler;
     message_handlers_t *msg_handler;
     
-    /* release all ack_handler_list memory */
+    /* 释放所有 ack_handler_list 内存 */
     if (!(mqtt_list_is_empty(&c->mqtt_ack_handler_list))) {
         LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_ack_handler_list) {
             ack_handler = LIST_ENTRY(curr, ack_handlers_t, list);
             mqtt_list_del(&ack_handler->list);
-            //@lchnu, 2020-10-08, avoid socket disconnet when waiting for suback/unsuback....
+            //@lchnu, 2020-10-08, 避免在等待 suback/unsuback 时断开 socket...
             if(NULL != ack_handler->handler) {
               mqtt_msg_handler_destory(ack_handler->handler);
               ack_handler->handler = NULL;
@@ -544,10 +817,10 @@ static void mqtt_clean_session(mqtt_client_t* c)
         }
         mqtt_list_del_init(&c->mqtt_ack_handler_list);
     }
-    /* need clean mqtt_ack_handler_number value, find the bug by @lchnu */
+    /* 需要清理 mqtt_ack_handler_number 值，由 @lchnu 发现的 bug */
     c->mqtt_ack_handler_number = 0;
 
-    /* release all msg_handler_list memory */
+    /* 释放所有 msg_handler_list 内存 */
     if (!(mqtt_list_is_empty(&c->mqtt_msg_handler_list))) {
         LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_msg_handler_list) {
             msg_handler = LIST_ENTRY(curr, message_handlers_t, list);
@@ -562,11 +835,15 @@ static void mqtt_clean_session(mqtt_client_t* c)
     mqtt_set_client_state(c, CLIENT_STATE_INVALID);
 }
 
-
 /**
- * see if there is a message waiting for the server to answer in the ack list, if there is, then process it according to the flag.
- * flag : 0 means it does not need to wait for the timeout to process these packets immediately. usually immediately after reconnecting.
- *        1 means it needs to wait for timeout before processing these messages, usually timeout processing in a stable connection.
+ * @brief 扫描 ACK 列表，处理超时的报文
+ * 
+ * 检查 ACK 列表中是否有等待服务器响应的消息，如果有，则根据标志进行处理。
+ * flag : 0 表示不需要等待超时就立即处理这些报文，通常在重连后立即处理。
+ *        1 表示需要等待超时后再处理这些消息，通常在稳定连接中的超时处理。
+ * 
+ * @param[in] c     指向 MQTT 客户端实例的指针
+ * @param[in] flag  处理标志（0: 立即处理, 1: 等待超时）
  */
 static void mqtt_ack_list_scan(mqtt_client_t* c, uint8_t flag)
 {
@@ -584,23 +861,33 @@ static void mqtt_ack_list_scan(mqtt_client_t* c, uint8_t flag)
         
         if ((ack_handler->type ==  PUBACK) || (ack_handler->type ==  PUBREC) || (ack_handler->type ==  PUBREL) || (ack_handler->type ==  PUBCOMP)) {
             
-            /* timeout has occurred. for qos1 and qos2 packets, you need to resend them. */
+            /* 超时已发生。对于 QoS1 和 QoS2 报文，需要重发它们。 */
             mqtt_ack_handler_resend(c, ack_handler);
             continue;
         } else if ((ack_handler->type == SUBACK) || (ack_handler->type == UNSUBACK)) {
             
-            /*@lchnu, 2020-10-08, destory handler memory, if suback/unsuback is overdue!*/
+            /*@lchnu, 2020-10-08, 如果 suback/unsuback 超时，销毁处理器内存！*/
             if (NULL != ack_handler->handler) {
                 mqtt_msg_handler_destory(ack_handler->handler);
                 ack_handler->handler = NULL;
             }
         }
-        /* if it is not a qos1 or qos2 message, it will be destroyed in every processing */
+        /* 如果不是 QoS1 或 QoS2 消息，将在每次处理时被销毁 */
         mqtt_ack_handler_destroy(ack_handler);
         mqtt_subtract_ack_handler_num(c); /*@lchnu, 2020-10-08 */
     }
 }
 
+/**
+ * @brief 尝试重新订阅所有主题
+ * 
+ * 在重连后重新订阅之前的所有主题。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 重订阅成功
+ *   - MQTT_RESUBSCRIBE_ERROR: 重订阅失败
+ */
 static int mqtt_try_resubscribe(mqtt_client_t* c)
 {
     int rc = MQTT_RESUBSCRIBE_ERROR;
@@ -617,7 +904,7 @@ static int mqtt_try_resubscribe(mqtt_client_t* c)
     LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_msg_handler_list) {
         msg_handler = LIST_ENTRY(curr, message_handlers_t, list);
 
-        /* resubscribe topic */
+        /* 重新订阅主题 */
         if ((rc = mqtt_subscribe(c, msg_handler->topic_filter, msg_handler->qos, msg_handler->handler)) == MQTT_ACK_HANDLER_NUM_TOO_MUCH_ERROR)
             MQTT_LOG_W("%s:%d %s()... mqtt ack handler num too much ...", __FILE__, __LINE__, __FUNCTION__);
 
@@ -626,16 +913,24 @@ static int mqtt_try_resubscribe(mqtt_client_t* c)
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 尝试执行重连
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 重连成功
+ *   - MQTT_CONNECT_FAILED_ERROR: 重连失败
+ */
 static int mqtt_try_do_reconnect(mqtt_client_t* c)
 {
     int rc = MQTT_CONNECT_FAILED_ERROR;
 
     if (CLIENT_STATE_CONNECTED != mqtt_get_client_state(c))
-        rc = mqtt_connect(c);       /* reconnect */
+        rc = mqtt_connect(c);       /* 重连 */
     
     if (MQTT_SUCCESS_ERROR == rc) {
-        rc = mqtt_try_resubscribe(c);   /* resubscribe */
-        /* process these ack messages immediately after reconnecting */
+        rc = mqtt_try_resubscribe(c);   /* 重新订阅 */
+        /* 重连后立即处理这些 ACK 消息 */
         mqtt_ack_list_scan(c, 0);
     }
 
@@ -644,11 +939,19 @@ static int mqtt_try_do_reconnect(mqtt_client_t* c)
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 尝试重连
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 重连成功
+ *   - MQTT_RECONNECT_TIMEOUT_ERROR: 重连超时
+ */
 static int mqtt_try_reconnect(mqtt_client_t* c)
 {
     int rc = MQTT_SUCCESS_ERROR;
 
-    /*before connect, call reconnect handler, it can used to update the mqtt password, eg: onenet platform need*/
+    /*连接前，调用重连处理器，可用于更新 MQTT 密码，例如：OneNET 平台需要*/
     if (NULL != c->mqtt_reconnect_handler) {
         c->mqtt_reconnect_handler(c, c->mqtt_reconnect_data);
     }
@@ -656,7 +959,7 @@ static int mqtt_try_reconnect(mqtt_client_t* c)
     rc = mqtt_try_do_reconnect(c);
 
     if(MQTT_SUCCESS_ERROR != rc) {
-        /*connect fail must delay reconnect try duration time and let cpu time go out, the lowest priority task can run */
+        /*连接失败必须延迟重连尝试持续时间并让 CPU 时间流逝，最低优先级任务可以运行 */
         mqtt_sleep_ms(c->mqtt_reconnect_try_duration);  
         RETURN_ERROR(MQTT_RECONNECT_TIMEOUT_ERROR);    
     }
@@ -664,6 +967,20 @@ static int mqtt_try_reconnect(mqtt_client_t* c)
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 发送发布确认报文
+ * 
+ * 根据收到的 PUBREC 或 PUBREL 报文，发送相应的确认报文。
+ * 这是 QoS 2 消息传输流程的一部分。
+ * 
+ * @param[in] c          指向 MQTT 客户端实例的指针
+ * @param[in] packet_id  报文 ID
+ * @param[in] packet_type 报文类型（PUBREC 或 PUBREL）
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 发送成功
+ *   - MQTT_PUBLISH_ACK_TYPE_ERROR: 报文类型错误
+ *   - MQTT_PUBLISH_ACK_PACKET_ERROR: 报文序列化失败
+ */
 static int mqtt_publish_ack_packet(mqtt_client_t *c, uint16_t packet_id, int packet_type)
 {
     int len = 0;
@@ -676,14 +993,14 @@ static int mqtt_publish_ack_packet(mqtt_client_t *c, uint16_t packet_id, int pac
 
     switch (packet_type) {
         case PUBREC:
-            len = MQTTSerialize_ack(c->mqtt_write_buf, c->mqtt_write_buf_size, PUBREL, 0, packet_id); /* make a PUBREL ack packet */
-            rc = mqtt_ack_list_record(c, PUBCOMP, packet_id, len, NULL);   /* record ack, expect to receive PUBCOMP*/
+            len = MQTTSerialize_ack(c->mqtt_write_buf, c->mqtt_write_buf_size, PUBREL, 0, packet_id); /* 创建 PUBREL 确认报文 */
+            rc = mqtt_ack_list_record(c, PUBCOMP, packet_id, len, NULL);   /* 记录 ACK，期望收到 PUBCOMP */
             if (MQTT_SUCCESS_ERROR != rc)
                 goto exit;
             break;
             
         case PUBREL:
-            len = MQTTSerialize_ack(c->mqtt_write_buf, c->mqtt_write_buf_size, PUBCOMP, 0, packet_id); /* make a PUBCOMP ack packet */
+            len = MQTTSerialize_ack(c->mqtt_write_buf, c->mqtt_write_buf_size, PUBCOMP, 0, packet_id); /* 创建 PUBCOMP 确认报文 */
             break;
             
         default:
@@ -704,6 +1021,19 @@ exit:
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 处理 PUBACK 和 PUBCOMP 报文
+ * 
+ * 处理 QoS 1 的 PUBACK 和 QoS 2 的 PUBCOMP 确认报文。
+ * 从 ACK 列表中删除对应的记录，表示消息已确认。
+ * 
+ * @param[in] c      指向 MQTT 客户端实例的指针
+ * @param[in] timer  超时定时器
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 处理成功
+ *   - MQTT_PUBREC_PACKET_ERROR: 报文解析失败
+ *   - 其他错误码: 处理失败
+ */
 static int mqtt_puback_and_pubcomp_packet_handle(mqtt_client_t *c, platform_timer_t *timer)
 {
     int rc = MQTT_FAILED_ERROR;
@@ -718,7 +1048,7 @@ static int mqtt_puback_and_pubcomp_packet_handle(mqtt_client_t *c, platform_time
         rc = MQTT_PUBREC_PACKET_ERROR;
     
     (void) dup;
-    rc = mqtt_ack_list_unrecord(c, packet_type, packet_id, NULL);   /* unrecord ack handler */
+    rc = mqtt_ack_list_unrecord(c, packet_type, packet_id, NULL);   /* 删除 ACK 处理器记录 */
 
     RETURN_ERROR(rc);
 }
@@ -855,7 +1185,7 @@ static int mqtt_pubrec_and_pubrel_packet_handle(mqtt_client_t *c, platform_timer
  * @brief 处理 MQTT 网络报文的核心函数
  *
  * 该函数负责接收并解析来自 MQTT 服务器的报文，并根据报文类型调用相应的处理逻辑。
- * 它是 MQTT 协议栈中实现“接收-分发”机制的关键环节，支持：
+ * 它是 MQTT 协议栈中实现"接收-分发"机制的关键环节，支持：
  *   - PUBLISH 消息接收
  *   - QoS 1/2 确认流程（PUBACK, PUBREC, PUBREL, PUBCOMP）
  *   - 订阅确认（SUBACK）
@@ -877,7 +1207,7 @@ static int mqtt_pubrec_and_pubrel_packet_handle(mqtt_client_t *c, platform_timer
  *   - 若读取时缓冲区太小（MQTT_BUFFER_TOO_SHORT_ERROR），不会立即返回，
  *     而是继续运行，以便后续处理（防止数据丢失）
  *   - 处理完报文后会调用 mqtt_keep_alive() 检查是否需要发送 PINGREQ
- *   - 返回值为 packet_type 是为了向上传递“已处理的报文类型”，便于调试和状态判断
+ *   - 返回值为 packet_type 是为了向上传递"已处理的报文类型"，便于调试和状态判断
  *
  * @see mqtt_yield, mqtt_read_packet, mqtt_keep_alive
  *
@@ -988,7 +1318,7 @@ static int mqtt_packet_handle(mqtt_client_t* c, platform_timer_t* timer)
 
 exit:
     // 如果整体处理成功（rc == 0），则返回实际处理的报文类型
-    // 这样上层可以知道“发生了什么”，便于调试和状态跟踪
+    // 这样上层可以知道"发生了什么"，便于调试和状态跟踪
     if (rc == MQTT_SUCCESS_ERROR)
         rc = packet_type;
 
@@ -1010,7 +1340,7 @@ static int mqtt_wait_packet(mqtt_client_t* c, int packet_type, platform_timer_t*
 }
 
 /**
- * @brief 执行 MQTT 客户端一次“轮询”操作，处理网络 I/O 与协议逻辑
+ * @brief 执行 MQTT 客户端一次"轮询"操作，处理网络 I/O 与协议逻辑
  *
  * 该函数是 MQTT 客户端的核心通信入口，用于：
  *   - 接收并处理来自服务器的报文（PUBLISH, PINGRESP, PUBACK 等）
@@ -1101,7 +1431,7 @@ static int mqtt_yield(mqtt_client_t* c, int timeout_ms)
  * @brief MQTT 客户端后台主循环线程函数
  *
  * 该函数作为独立线程运行，持续调用 mqtt_yield() 处理 MQTT 协议的底层通信，
- * 包括接收报文、发送保活 PING、触发回调等。它是实现“自动消息处理”的核心机制。
+ * 包括接收报文、发送保活 PING、触发回调等。它是实现"自动消息处理"的核心机制。
  *
  * 线程启动后：
  *   - 首先检查客户端是否已连接
@@ -1271,7 +1601,7 @@ static int mqtt_connect_with_results(mqtt_client_t* c)
         connect_data.will.message.cstring   = c->mqtt_will_options->will_message;
     }
     
-    // 设置“最后接收时间”为当前时间 + keepAliveInterval
+    // 设置"最后接收时间"为当前时间 + keepAliveInterval
     // 用于后续 PING 操作的判断
     platform_timer_cutdown(&c->mqtt_last_received, (c->mqtt_keep_alive_interval * 1000));
 
@@ -1363,6 +1693,16 @@ exit:
 
 
 
+/**
+ * @brief 分配读缓冲区内存
+ * 
+ * 为 MQTT 客户端分配或重新分配读缓冲区。
+ * 如果缓冲区大小超出限制，将使用默认大小。
+ * 
+ * @param[in] c    指向 MQTT 客户端实例的指针
+ * @param[in] size 请求的缓冲区大小
+ * @return 实际分配的缓冲区大小
+ */
 static uint32_t mqtt_read_buf_malloc(mqtt_client_t* c, uint32_t size)
 {
     MQTT_ROBUSTNESS_CHECK(c, 0);
@@ -1372,7 +1712,7 @@ static uint32_t mqtt_read_buf_malloc(mqtt_client_t* c, uint32_t size)
     
     c->mqtt_read_buf_size = size;
 
-    /* limit the size of the read buffer */
+    /* 限制读缓冲区的大小 */
     if ((MQTT_MIN_PAYLOAD_SIZE >= c->mqtt_read_buf_size) || (MQTT_MAX_PAYLOAD_SIZE <= c->mqtt_read_buf_size))
         c->mqtt_read_buf_size = MQTT_DEFAULT_BUF_SIZE;
     
@@ -1385,6 +1725,16 @@ static uint32_t mqtt_read_buf_malloc(mqtt_client_t* c, uint32_t size)
     return c->mqtt_read_buf_size;
 }
 
+/**
+ * @brief 分配写缓冲区内存
+ * 
+ * 为 MQTT 客户端分配或重新分配写缓冲区。
+ * 如果缓冲区大小超出限制，将使用默认大小。
+ * 
+ * @param[in] c    指向 MQTT 客户端实例的指针
+ * @param[in] size 请求的缓冲区大小
+ * @return 实际分配的缓冲区大小
+ */
 static uint32_t mqtt_write_buf_malloc(mqtt_client_t* c, uint32_t size)
 {
     MQTT_ROBUSTNESS_CHECK(c, 0);
@@ -1394,7 +1744,7 @@ static uint32_t mqtt_write_buf_malloc(mqtt_client_t* c, uint32_t size)
     
     c->mqtt_write_buf_size = size;
 
-    /* limit the size of the read buffer */
+    /* 限制写缓冲区的大小 */
     if ((MQTT_MIN_PAYLOAD_SIZE >= c->mqtt_write_buf_size) || (MQTT_MAX_PAYLOAD_SIZE <= c->mqtt_write_buf_size))
         c->mqtt_write_buf_size = MQTT_DEFAULT_BUF_SIZE;
     
@@ -1407,9 +1757,20 @@ static uint32_t mqtt_write_buf_malloc(mqtt_client_t* c, uint32_t size)
     return c->mqtt_write_buf_size;
 }
 
+/**
+ * @brief 初始化 MQTT 客户端
+ * 
+ * 初始化客户端结构体的所有字段，分配必要的内存和资源。
+ * 设置默认参数，初始化列表、互斥锁和定时器。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 初始化成功
+ *   - MQTT_MEM_NOT_ENOUGH_ERROR: 内存不足
+ */
 static int mqtt_init(mqtt_client_t* c)
 {
-    /* network init */
+    /* 网络初始化 */
     c->mqtt_network = (network_t*) platform_memory_alloc(sizeof(network_t));
 
     if (NULL == c->mqtt_network) {
@@ -1419,7 +1780,7 @@ static int mqtt_init(mqtt_client_t* c)
     memset(c->mqtt_network, 0, sizeof(network_t));
 
     c->mqtt_packet_id = 1;
-    c->mqtt_clean_session = 0;          //no clear session by default
+    c->mqtt_clean_session = 0;          //默认不清除会话
     c->mqtt_will_flag = 0;
     c->mqtt_cmd_timeout = MQTT_DEFAULT_CMD_TIMEOUT;
     c->mqtt_client_state = CLIENT_STATE_INITIALIZED;
@@ -1471,21 +1832,53 @@ MQTT_CLIENT_SET_DEFINE(reconnect_try_duration, uint32_t, 0)
 MQTT_CLIENT_SET_DEFINE(reconnect_handler, reconnect_handler_t, NULL)
 MQTT_CLIENT_SET_DEFINE(interceptor_handler, interceptor_handler_t, NULL)
 
+/**
+ * @brief 设置读缓冲区大小
+ * 
+ * @param[in] c    指向 MQTT 客户端实例的指针
+ * @param[in] size 新的缓冲区大小
+ * @return 实际设置的缓冲区大小
+ */
 uint32_t mqtt_set_read_buf_size(mqtt_client_t *c, uint32_t size) 
 { 
     return mqtt_read_buf_malloc(c, size);
 }
 
+/**
+ * @brief 设置写缓冲区大小
+ * 
+ * @param[in] c    指向 MQTT 客户端实例的指针
+ * @param[in] size 新的缓冲区大小
+ * @return 实际设置的缓冲区大小
+ */
 uint32_t mqtt_set_write_buf_size(mqtt_client_t *c, uint32_t size) 
 { 
     return mqtt_write_buf_malloc(c, size);
 }
 
+/**
+ * @brief 毫秒级延时函数
+ * 
+ * @param[in] ms 延时时间（毫秒）
+ */
 void mqtt_sleep_ms(int ms)
 {
     platform_timer_usleep(ms * 1000);
 }
 
+/**
+ * @brief MQTT 保活机制处理
+ * 
+ * 检查是否需要发送 PINGREQ 报文以维持连接，或处理 PING 超时。
+ * 当超过保活间隔时间未发送或接收数据时，发送 PINGREQ。
+ * 如果 PING 请求未收到响应，则断开连接。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 保活处理成功
+ *   - MQTT_NOT_CONNECT_ERROR: 连接已断开
+ *   - 其他错误码: 保活处理失败
+ */
 int mqtt_keep_alive(mqtt_client_t* c)
 {
     int rc = MQTT_SUCCESS_ERROR;
@@ -1497,16 +1890,16 @@ int mqtt_keep_alive(mqtt_client_t* c)
     if (platform_timer_is_expired(&c->mqtt_last_sent) || platform_timer_is_expired(&c->mqtt_last_received)) {
         if (c->mqtt_ping_outstanding) {
             MQTT_LOG_W("%s:%d %s()... ping outstanding", __FILE__, __LINE__, __FUNCTION__);
-            /*must realse the socket file descriptor zhaoshimin 20200629*/
+            /*必须释放 socket 文件描述符 zhaoshimin 20200629*/
             network_release(c->mqtt_network);
             
             mqtt_set_client_state(c, CLIENT_STATE_DISCONNECTED);
-            rc = MQTT_NOT_CONNECT_ERROR; /* PINGRESP not received in keepalive interval */
+            rc = MQTT_NOT_CONNECT_ERROR; /* 在保活间隔内未收到 PINGRESP */
         } else {
             platform_timer_t timer;
             int len = MQTTSerialize_pingreq(c->mqtt_write_buf, c->mqtt_write_buf_size);
             if (len > 0)
-                rc = mqtt_send_packet(c, len, &timer); // 100ask, send the ping packet
+                rc = mqtt_send_packet(c, len, &timer); // 100ask, 发送 ping 报文
             c->mqtt_ping_outstanding++;
         }
     }
@@ -1514,6 +1907,18 @@ int mqtt_keep_alive(mqtt_client_t* c)
     RETURN_ERROR(rc);
 }
 
+/**
+ * @brief 创建并初始化 MQTT 客户端实例
+ * 
+ * 分配内存并初始化 MQTT 客户端结构体，设置默认参数。
+ * 这是使用 MQTT 客户端的第一个步骤。
+ * 
+ * @return 指向初始化后的 MQTT 客户端实例的指针，失败时返回 NULL
+ * 
+ * @note 使用完毕后应调用 mqtt_release() 释放资源
+ * 
+ * @see mqtt_release, mqtt_connect
+ */
 mqtt_client_t *mqtt_lease(void)
 {
     int rc;
@@ -1532,6 +1937,22 @@ mqtt_client_t *mqtt_lease(void)
     return c;
 }
 
+/**
+ * @brief 释放 MQTT 客户端资源
+ * 
+ * 等待会话清理完成，释放所有分配的内存和系统资源。
+ * 包括网络连接、读写缓冲区、互斥锁等。
+ * 
+ * @param[in] c  指向要释放的 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 释放成功
+ *   - MQTT_NULL_VALUE_ERROR: 参数为空
+ *   - MQTT_FAILED_ERROR: 释放失败（如超时）
+ * 
+ * @note 调用此函数后，客户端实例将不可用
+ * 
+ * @see mqtt_lease
+ */
 int mqtt_release(mqtt_client_t* c)
 {
     platform_timer_t timer;
@@ -1542,9 +1963,9 @@ int mqtt_release(mqtt_client_t* c)
     platform_timer_init(&timer);
     platform_timer_cutdown(&timer, c->mqtt_cmd_timeout);
     
-    /* wait for the clean session to complete */
+    /* 等待会话清理完成 */
     while ((CLIENT_STATE_INVALID != mqtt_get_client_state(c))) {
-        // platform_timer_usleep(1000);            // 1ms avoid compiler optimization.
+        // platform_timer_usleep(1000);            // 1ms 避免编译器优化
         if (platform_timer_is_expired(&timer)) {
             MQTT_LOG_E("%s:%d %s()... mqtt release failed...", __FILE__, __LINE__, __FUNCTION__);
             RETURN_ERROR(MQTT_FAILED_ERROR)
@@ -1574,12 +1995,42 @@ int mqtt_release(mqtt_client_t* c)
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
+/**
+ * @brief 连接到 MQTT 服务器
+ * 
+ * 以阻塞模式连接服务器并等待连接结果。
+ * 这是建立 MQTT 连接的主要接口。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 连接成功
+ *   - 其他错误码: 连接失败
+ * 
+ * @note 连接前需要先设置服务器地址、客户端 ID 等参数
+ * 
+ * @see mqtt_disconnect, mqtt_set_host, mqtt_set_client_id
+ */
 int mqtt_connect(mqtt_client_t* c)
 {
-    /* connect server in blocking mode and wait for connection result */
+    /* 以阻塞模式连接服务器并等待连接结果 */
     return mqtt_connect_with_results(c);
 }
 
+/**
+ * @brief 断开 MQTT 连接
+ * 
+ * 发送 DISCONNECT 报文并清理会话状态。
+ * 这是优雅断开连接的标准方式。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 断开成功
+ *   - 其他错误码: 断开失败
+ * 
+ * @note 断开后客户端状态将变为 CLEAN_SESSION
+ * 
+ * @see mqtt_connect
+ */
 int mqtt_disconnect(mqtt_client_t* c)
 {
     int rc = MQTT_FAILED_ERROR;
@@ -1591,7 +2042,7 @@ int mqtt_disconnect(mqtt_client_t* c)
 
     platform_mutex_lock(&c->mqtt_write_lock);
 
-    /* serialize disconnect packet and send it */
+    /* 序列化断开连接报文并发送 */
     len = MQTTSerialize_disconnect(c->mqtt_write_buf, c->mqtt_write_buf_size);
     if (len > 0)
         rc = mqtt_send_packet(c, len, &timer);
@@ -1621,7 +2072,7 @@ int mqtt_disconnect(mqtt_client_t* c)
  *   - MQTT_SUBSCRIBE_ERROR: 序列化或发送失败
  *
  * @note
- *   - 订阅是否成功需等待 Broker 返回 SUBACK 报文，此函数仅表示“发送成功”。
+ *   - 订阅是否成功需等待 Broker 返回 SUBACK 报文，此函数仅表示"发送成功"。
  *   - 若订阅失败（如权限不足、主题非法），错误将在 SUBACK 中体现，需在 ACK 处理流程中处理。
  *   - handler 回调会被异步调用（通常在接收线程或事件循环中），应保证线程安全。
  *   - 若指定 NULL handler，则使用 default_msg_handler 处理该主题的消息。
@@ -1692,6 +2143,22 @@ exit:
 }
 
 
+/**
+ * @brief 取消订阅 MQTT 主题
+ * 
+ * 向 MQTT Broker 发送 UNSUBSCRIBE 报文，请求取消订阅指定的主题。
+ * 取消订阅后，Broker 将不再向客户端推送该主题的消息。
+ * 
+ * @param[in] c            指向已连接的 MQTT 客户端实例
+ * @param[in] topic_filter 要取消订阅的主题过滤器
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 取消订阅请求已成功发送
+ *   - MQTT_NOT_CONNECT_ERROR: 客户端未连接
+ *   - MQTT_MEM_NOT_ENOUGH_ERROR: 内存不足
+ *   - 其他错误码: 发送失败
+ * 
+ * @note 取消订阅是否成功需等待 Broker 返回 UNSUBACK 报文
+ */
 int mqtt_unsubscribe(mqtt_client_t* c, const char* topic_filter)
 {
     int len = 0;
@@ -1709,13 +2176,13 @@ int mqtt_unsubscribe(mqtt_client_t* c, const char* topic_filter)
 
     packet_id = mqtt_get_next_packet_id(c);
     
-    /* serialize unsubscribe packet and send it */
+    /* 序列化取消订阅报文并发送 */
     if ((len = MQTTSerialize_unsubscribe(c->mqtt_write_buf, c->mqtt_write_buf_size, 0, packet_id, 1, &topic)) <= 0)
         goto exit;
     if ((rc = mqtt_send_packet(c, len, &timer)) != MQTT_SUCCESS_ERROR)
         goto exit; 
 
-    /* get a already subscribed message handler */
+    /* 获取已订阅的消息处理器 */
     msg_handler = mqtt_get_msg_handler(c, &topic);
     if (NULL == msg_handler) {
         rc = MQTT_MEM_NOT_ENOUGH_ERROR;
@@ -1854,6 +2321,17 @@ exit:
 }
 
 
+/**
+ * @brief 列出所有已订阅的主题
+ * 
+ * 遍历消息处理器列表，打印所有已订阅的主题信息。
+ * 用于调试和状态检查。
+ * 
+ * @param[in] c  指向 MQTT 客户端实例的指针
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 操作成功
+ *   - MQTT_NULL_VALUE_ERROR: 参数为空
+ */
 int mqtt_list_subscribe_topic(mqtt_client_t* c)
 {
     int i = 0;
@@ -1868,7 +2346,7 @@ int mqtt_list_subscribe_topic(mqtt_client_t* c)
 
     LIST_FOR_EACH_SAFE(curr, next, &c->mqtt_msg_handler_list) {
         msg_handler = LIST_ENTRY(curr, message_handlers_t, list);
-        /* determine whether a node already exists by mqtt topic, but wildcards are not supported */
+        /* 通过 MQTT 主题判断节点是否已存在，但不支持通配符 */
         if (NULL != msg_handler->topic_filter) {
             MQTT_LOG_I("%s:%d %s()...[%d] subscribe topic: %s", __FILE__, __LINE__, __FUNCTION__, ++i ,msg_handler->topic_filter);
         }
@@ -1877,6 +2355,24 @@ int mqtt_list_subscribe_topic(mqtt_client_t* c)
     RETURN_ERROR(MQTT_SUCCESS_ERROR);
 }
 
+/**
+ * @brief 设置遗嘱消息选项
+ * 
+ * 配置客户端断开连接时服务器要发布的遗嘱消息。
+ * 包括主题、QoS、保留标志和消息内容。
+ * 
+ * @param[in] c        指向 MQTT 客户端实例的指针
+ * @param[in] topic    遗嘱消息主题
+ * @param[in] qos      遗嘱消息 QoS 级别
+ * @param[in] retained 遗嘱消息保留标志
+ * @param[in] message  遗嘱消息内容
+ * @return 
+ *   - MQTT_SUCCESS_ERROR: 设置成功
+ *   - MQTT_NULL_VALUE_ERROR: 参数为空
+ *   - MQTT_MEM_NOT_ENOUGH_ERROR: 内存不足
+ * 
+ * @note 设置后需要在连接前调用，连接后设置无效
+ */
 int mqtt_set_will_options(mqtt_client_t* c, char *topic, mqtt_qos_t qos, uint8_t retained, char *message)
 {
     if ((NULL == c) || (NULL == topic))
